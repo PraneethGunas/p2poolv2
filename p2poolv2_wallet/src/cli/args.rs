@@ -14,22 +14,18 @@ const MIN_FEE_RATE: f64 = 1.0 / FEE_RATE_SCALE;
 
 /// Wallet command-line arguments.
 #[derive(Parser)]
-#[command(
-    name = "p2pool-wallet",
-    version,
-    about = "P2Poolv2 wallet CLI skeleton (wallet operations not implemented)"
-)]
+#[command(name = "p2pool-wallet", version, about = "P2Poolv2 descriptor wallet")]
 pub struct Cli {
     /// Share network: bitcoin (mainnet), testnet4, signet, or regtest.
     #[arg(short = 'n', long, global = true, default_value = "signet", value_parser = parse_network)]
     pub network: Network,
 
-    /// Wallet data directory.
+    /// Wallet data directory (default: ~/.p2pool-wallet).
     #[arg(short = 'd', long, global = true, value_hint = ValueHint::DirPath)]
     pub datadir: Option<PathBuf>,
 
-    /// Wallet to use; required for operations on a configured wallet.
-    #[arg(short = 'w', long, global = true)]
+    /// Wallet name, containing letters, digits, hyphens or underscores.
+    #[arg(short = 'w', long, global = true, value_parser = parse_wallet_name)]
     pub wallet: Option<String>,
 
     #[command(subcommand)]
@@ -63,6 +59,19 @@ impl Cli {
         }
         Ok(())
     }
+}
+
+fn parse_wallet_name(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(
+            "wallet names must contain only ASCII letters, digits, hyphens or underscores".into(),
+        );
+    }
+    Ok(value.to_owned())
 }
 
 /// A P2Pool recipient address and amount in share base units.

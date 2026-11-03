@@ -54,6 +54,9 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace
 
+      - name: Run wallet CLI tests
+        run: cargo nextest run --locked -p p2poolv2_wallet --features cli
+
       - name: Run sim-feature tests
         run: cargo nextest run -p p2poolv2_lib --features sim
 

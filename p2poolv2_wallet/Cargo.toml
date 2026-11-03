@@ -20,14 +20,17 @@ path = "src/bin/cli.rs"
 required-features = ["cli"]
 
 [features]
-cli = ["dep:clap", "dep:clap_complete"]
+cli = ["dep:clap", "dep:clap_complete", "dep:electrum-client", "dep:serde_json", "dep:tempfile"]
 
 [dependencies]
 bdk_wallet = { workspace = true }
 bitcoin = { workspace = true }
 clap = { workspace = true, optional = true }
 clap_complete = { workspace = true, optional = true }
+electrum-client = { workspace = true, optional = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

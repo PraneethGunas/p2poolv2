@@ -6,6 +6,7 @@
 
 mod args;
 mod commands;
+mod wallet;
 
 #[cfg(test)]
 mod tests;
@@ -13,31 +14,39 @@ mod tests;
 use args::Cli;
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
-use commands::{Command, CompletionCommand};
+use commands::{Command, CompletionCommand, WalletCommand};
 use std::io::{self, Write};
 use thiserror::Error;
 
 /// CLI failures after successful argument parsing.
 #[derive(Debug, Error)]
 pub enum CliError {
-    #[error("{command}: not implemented (CLI skeleton only)")]
+    #[error("{command}: not implemented")]
     NotImplemented { command: &'static str },
-    #[error("could not write completion script: {0}")]
-    CompletionOutput(#[from] io::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Import(#[from] wallet::ImportError),
 }
 
-/// Parse arguments and generate completions or report an unimplemented operation.
+/// Parse arguments and execute the selected command.
 pub fn run() -> Result<(), CliError> {
     let arguments = Cli::parse();
     arguments.validate().unwrap_or_else(|error| error.exit());
-    if let Command::Completion(CompletionCommand::Generate { shell }) = arguments.command {
-        let mut script = Vec::new();
-        generate(shell, &mut Cli::command(), "p2pool-wallet", &mut script);
-        io::stdout().lock().write_all(&script)?;
-        Ok(())
-    } else {
-        Err(CliError::NotImplemented {
+    match &arguments.command {
+        Command::Completion(CompletionCommand::Generate { shell }) => {
+            let mut script = Vec::new();
+            generate(*shell, &mut Cli::command(), "p2pool-wallet", &mut script);
+            io::stdout().lock().write_all(&script)?;
+            Ok(())
+        }
+        Command::Wallet(WalletCommand::Import(import)) => {
+            let path = wallet::import_wallet(&arguments, import)?;
+            writeln!(io::stdout().lock(), "Wallet saved at {}", path.display())?;
+            Ok(())
+        }
+        _ => Err(CliError::NotImplemented {
             command: arguments.command.name(),
-        })
+        }),
     }
 }
