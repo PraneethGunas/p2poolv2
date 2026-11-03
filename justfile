@@ -34,6 +34,10 @@ test package="":
     cargo nextest run {{ if package == "" { "" } else { "-p " + package } }}
     {{ if package == "" { "cargo nextest run -p p2poolv2_lib --features sim" } else { "true" } }}
 
+# Run wallet and CLI tests against one Electrum mock server.
+test-wallet *args:
+    cargo run --locked -p p2poolv2_wallet --example electrum -- 0 -- cargo nextest run --locked -p p2poolv2_wallet --features cli {{ args }}
+
 # Run a specific test in a package with debug logging and no output capture
 debug-test package="p2poolv2_tests" testname="":
     RUST_LOG=debug cargo test --package {{ package }} -- {{ testname }} --show-output --no-capture

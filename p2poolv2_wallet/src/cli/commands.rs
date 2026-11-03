@@ -7,6 +7,8 @@ use crate::Address;
 use bitcoin::{FeeRate, OutPoint};
 use clap::{ArgAction, ArgGroup, Args, Subcommand, ValueEnum, ValueHint};
 use clap_complete::Shell;
+use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
@@ -82,7 +84,7 @@ impl Command {
 
 #[derive(Subcommand)]
 pub enum WalletCommand {
-    /// Import wallet descriptors and configure the Electrum backend.
+    /// Create a watch-only wallet from Taproot descriptors.
     Import(ImportArgs),
     /// List saved wallet configurations.
     List,
@@ -150,19 +152,21 @@ pub enum CompletionCommand {
     },
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Debug, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum ClientType {
     Electrum,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Debug, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum DatabaseType {
     Sqlite,
 }
 
 #[derive(Args)]
 pub struct ImportArgs {
-    /// External receiving descriptor, or a multipath descriptor.
+    /// Public receiving descriptor, or a public two-path descriptor.
     #[arg(short = 'e', long)]
     pub ext_descriptor: String,
     /// Optional internal/change descriptor.
@@ -178,8 +182,8 @@ pub struct ImportArgs {
     #[arg(short = 'u', long, value_hint = ValueHint::Url)]
     pub url: String,
     /// Maximum number of queries per Electrum batch.
-    #[arg(short = 'b', long, default_value_t = 10)]
-    pub batch_size: usize,
+    #[arg(short = 'b', long, default_value = "10")]
+    pub batch_size: NonZeroUsize,
     /// Replace an existing wallet configuration.
     #[arg(long)]
     pub force: bool,

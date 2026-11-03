@@ -54,6 +54,9 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace
 
+      - name: Run wallet CLI tests
+        run: cargo run --locked -p p2poolv2_wallet --example electrum -- 0 -- cargo nextest run --locked -p p2poolv2_wallet --features cli
+
       - name: Run sim-feature tests
         run: cargo nextest run -p p2poolv2_lib --features sim
 
@@ -75,7 +78,7 @@ jobs:
       # crate, which changes test semantics for anything touching process
       # state and can fail here while passing there.
       - name: Generate code coverage
-        run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
+        run: cargo run --locked -p p2poolv2_wallet --example electrum -- 0 -- cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
       # Dependabot runs read the Dependabot secret store, not the Actions one,
       # so the token is empty there and a protected branch rejects the upload.
       # Coverage is still generated above, which is what catches a dependency
