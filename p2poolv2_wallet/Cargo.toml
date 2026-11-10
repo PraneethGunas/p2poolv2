@@ -14,7 +14,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-wallet = ["dep:bdk_wallet", "dep:electrum-client", "dep:serde_json"]
+wallet = ["dep:bdk_wallet", "dep:electrum-client", "dep:serde_json", "dep:tempfile"]
 
 [dependencies]
 bdk_wallet = { workspace = true, optional = true }
@@ -22,6 +22,7 @@ bitcoin = { workspace = true }
 electrum-client = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

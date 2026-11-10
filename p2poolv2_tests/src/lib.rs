@@ -16,3 +16,5 @@ mod stratum_server_test;
 mod test_api_server_health_check;
 #[cfg(test)]
 mod wallet_electrum_test;
+#[cfg(test)]
+mod wallet_import_test;
