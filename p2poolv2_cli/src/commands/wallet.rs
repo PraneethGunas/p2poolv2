@@ -2,21 +2,24 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Descriptor wallet commands.
+//! Descriptor wallet commands, run against a P2Poolv2 Electrum server.
 //!
 //! Each wallet is a SQLite file at `<datadir>/<network>/<name>.sqlite`. The
 //! default wallet, used when `--wallet` is not given, is saved with its
-//! network in `<datadir>/wallet.toml`.
+//! network in `<datadir>/wallet.toml`. The first wallet imported into a data
+//! directory with no default becomes the default.
 
 use crate::commands::{WalletCommands, WalletDefaultCommands};
 use clap::{Args, ValueHint};
 use p2poolv2_lib::config::Chain;
-use p2poolv2_wallet::expected_hrp;
+use p2poolv2_wallet::import::import_wallet;
+use p2poolv2_wallet::{ElectrumConfig, expected_hrp};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::{ErrorKind, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
@@ -108,14 +111,79 @@ impl SelectWalletArgs {
     }
 }
 
+/// Arguments of `wallet import`.
+#[derive(Args, Debug)]
+pub struct ImportArgs {
+    #[command(flatten)]
+    pub datadir_args: DatadirArgs,
+    /// Name of the new wallet: ASCII letters, digits, hyphens or underscores
+    #[arg(long, value_parser = parse_wallet_name)]
+    pub name: String,
+    /// Network of the new wallet: main, testnet4, testnet5, signet or regtest
+    /// (default: testnet5)
+    #[arg(short, long, env = "P2POOLV2_NETWORK", value_parser = parse_wallet_chain)]
+    pub network: Option<Chain>,
+    /// Public receive descriptor, or a two-path descriptor for receive and change
+    #[arg(long)]
+    pub descriptor: String,
+    /// Public change descriptor
+    #[arg(long)]
+    pub change_descriptor: Option<String>,
+    /// P2Poolv2 Electrum server URL: tcp://HOST:PORT
+    #[arg(short, long, value_hint = ValueHint::Url)]
+    pub url: String,
+    /// Maximum number of queries per Electrum batch
+    #[arg(short, long, default_value = "10")]
+    pub batch_size: NonZeroUsize,
+}
+
 /// Execute a wallet command.
 pub fn execute(command: &WalletCommands) -> Result<(), Box<dyn Error>> {
     match command {
+        WalletCommands::Import(arguments) => execute_import(arguments),
         WalletCommands::Default { command } => match command {
             WalletDefaultCommands::Set(arguments) => execute_default_set(arguments),
             WalletDefaultCommands::Show(datadir_args) => execute_default_show(datadir_args),
         },
     }
+}
+
+/// Import descriptors into a new wallet and print where it was saved. The new
+/// wallet becomes the default if the data directory has none.
+fn execute_import(arguments: &ImportArgs) -> Result<(), Box<dyn Error>> {
+    //* Read the saved default before anything is created, so a broken wallet.toml stops the import.
+    let datadir = arguments.datadir_args.resolve()?;
+    let default_wallet = read_default_wallet(&datadir)?;
+    let new_wallet = WalletSelection {
+        name: arguments.name.clone(),
+        chain: arguments.network.unwrap_or(DEFAULT_CHAIN),
+    };
+    let path = new_wallet.path(&datadir);
+
+    //* Create the wallet against the Electrum server.
+    let electrum_config = ElectrumConfig {
+        url: arguments.url.clone(),
+        batch_size: arguments.batch_size,
+    };
+    import_wallet(
+        &path,
+        &arguments.descriptor,
+        arguments.change_descriptor.as_deref(),
+        new_wallet.chain.bitcoin_network(),
+        &electrum_config,
+    )
+    .map_err(|error| error.to_string())?;
+    println!("Wallet saved at {}", path.display());
+
+    //* Make it the default if there is none yet.
+    if default_wallet.is_none() {
+        write_default_wallet(&datadir, &new_wallet)?;
+        println!(
+            "Default wallet set to {} ({})",
+            new_wallet.name, new_wallet.chain
+        );
+    }
+    Ok(())
 }
 
 /// Save the selected wallet as the default in `<datadir>/wallet.toml`.
@@ -260,35 +328,91 @@ fn parse_wallet_name(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::Cli;
+    use crate::commands::{Cli, Commands};
     use clap::{CommandFactory, Parser, error::ErrorKind};
     use tempfile::tempdir;
 
     #[test]
-    fn wallet_names_and_networks_are_validated() {
+    fn wallet_import_parses_options_and_defaults() {
         Cli::command().debug_assert();
+        let parsed = Cli::try_parse_from([
+            "p2poolv2_cli",
+            "wallet",
+            "import",
+            "--datadir",
+            "/tmp/wallets",
+            "--name",
+            "alice",
+            "--descriptor",
+            "tr(key)",
+            "-u",
+            "tcp://127.0.0.1:50001",
+        ])
+        .unwrap();
+        let Some(Commands::Wallet {
+            command: WalletCommands::Import(arguments),
+        }) = parsed.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(arguments.name, "alice");
+        assert_eq!(arguments.network, None);
+        assert_eq!(arguments.batch_size.get(), 10);
+        assert_eq!(
+            WalletSelection {
+                name: "alice".to_owned(),
+                chain: Chain::Testnet5,
+            }
+            .path(Path::new("/tmp/wallets")),
+            Path::new("/tmp/wallets/testnet5/alice.sqlite")
+        );
+    }
+
+    #[test]
+    fn wallet_names_networks_and_batch_sizes_are_validated() {
         let path_name = Cli::try_parse_from([
             "p2poolv2_cli",
             "wallet",
-            "default",
-            "set",
-            "--wallet",
+            "import",
+            "--name",
             "../alice",
+            "--descriptor",
+            "tr(key)",
+            "-u",
+            "tcp://127.0.0.1:50001",
         ])
         .unwrap_err();
         assert_eq!(path_name.kind(), ErrorKind::ValueValidation);
         let testnet3 = Cli::try_parse_from([
             "p2poolv2_cli",
             "wallet",
-            "default",
-            "set",
-            "--wallet",
-            "alice",
+            "import",
             "-n",
             "test",
+            "--name",
+            "alice",
+            "--descriptor",
+            "tr(key)",
+            "-u",
+            "tcp://127.0.0.1:50001",
         ])
         .unwrap_err();
         assert_eq!(testnet3.kind(), ErrorKind::ValueValidation);
+        let zero_batch = Cli::try_parse_from([
+            "p2poolv2_cli",
+            "wallet",
+            "import",
+            "--name",
+            "alice",
+            "--descriptor",
+            "tr(key)",
+            "-u",
+            "tcp://127.0.0.1:50001",
+            "--batch-size",
+            "0",
+        ])
+        .unwrap_err();
+        assert_eq!(zero_batch.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]

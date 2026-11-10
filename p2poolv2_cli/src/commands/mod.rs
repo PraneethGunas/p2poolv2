@@ -148,7 +148,7 @@ pub enum Commands {
         /// Password (leave empty to auto-generate, or use "-" to prompt)
         password: Option<String>,
     },
-    /// Descriptor wallet commands
+    /// Descriptor wallet commands (requires a P2Poolv2 Electrum server)
     Wallet {
         #[command(subcommand)]
         command: WalletCommands,
@@ -157,6 +157,8 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum WalletCommands {
+    /// Create a wallet from public taproot descriptors
+    Import(commands::wallet::ImportArgs),
     /// Set or show the wallet used when none is named
     Default {
         #[command(subcommand)]
