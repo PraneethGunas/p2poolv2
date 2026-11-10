@@ -161,6 +161,28 @@ p2poolv2_cli gen-auth myuser           # auto-generate password
 p2poolv2_cli gen-auth myuser mypass    # use provided password
 ```
 
+### wallet
+
+Descriptor wallet commands. Requires a P2Poolv2 Electrum server, not a
+running node or config file. Each wallet is a SQLite file at
+`<datadir>/<network>/<name>.sqlite`, and `--datadir` defaults to
+`~/.p2poolv2_wallet`.
+
+#### import
+
+Create a wallet from public taproot descriptors. The Electrum server must
+be on `--network`, and the wallet is tied to the share chain it reports.
+Descriptors with private keys are rejected.
+
+```sh
+p2poolv2_cli wallet import --network signet --wallet alice \
+  --descriptor "tr([fingerprint/86h/1h/0h]tpub.../<0;1>/*)" \
+  --url tcp://127.0.0.1:50001
+```
+
+A two-path descriptor gives both receive and change addresses. Pass a
+separate change descriptor with `--change-descriptor`.
+
 ## Viewing DOT output
 
 The `--dot` flag (available on `shares` and `candidates` in `--db-path`
