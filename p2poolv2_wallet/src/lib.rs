@@ -76,6 +76,8 @@
 //! needs the address to build a share coinbase output.
 
 #[cfg(feature = "wallet")]
+pub mod electrum;
+#[cfg(feature = "wallet")]
 pub mod wallet;
 pub mod witness_program_codec;
 
