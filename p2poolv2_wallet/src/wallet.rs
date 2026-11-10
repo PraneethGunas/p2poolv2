@@ -4,17 +4,19 @@
 
 //! Taproot descriptor wallets saved in SQLite.
 
-use crate::{AddressError, expected_hrp};
+use crate::{Address, AddressError, expected_hrp};
 use bdk_wallet::descriptor::{DescriptorError, ExtendedDescriptor, IntoWalletDescriptor};
 use bdk_wallet::miniscript::descriptor::KeyMap;
 use bdk_wallet::rusqlite::{Connection, Error as SqliteError, OpenFlags};
 use bdk_wallet::{
-    CreateWithPersistError, KeychainKind, LoadError, LoadWithPersistError, PersistedWallet,
-    Wallet as BdkWallet,
+    AddressInfo as BdkAddressInfo, CreateWithPersistError, KeychainKind, LoadError,
+    LoadWithPersistError, PersistedWallet, Wallet as BdkWallet,
 };
 use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{BlockHash, Network};
+use bitcoin::{BlockHash, Network, ScriptBuf};
+use std::fmt;
 use std::io;
+use std::ops::Deref;
 use std::path::Path;
 
 /// The network and share chain a wallet belongs to.
@@ -26,10 +28,51 @@ pub struct ChainIdentity {
     pub sharechain_genesis_hash: BlockHash,
 }
 
+/// A derived share chain address, its child index and keychain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressInfo {
+    /// Child index used to derive the address.
+    pub index: u32,
+    /// Share chain address of the derived taproot output.
+    pub address: Address,
+    /// Keychain used to derive the address.
+    pub keychain: KeychainKind,
+}
+
+impl AddressInfo {
+    /// Encode a derived address as a share chain address on `network`.
+    fn from_bdk(derived: BdkAddressInfo, network: Network) -> Result<Self, WalletError> {
+        let program = derived
+            .address
+            .witness_program()
+            .ok_or(WalletError::UnsupportedDescriptor(derived.keychain))?;
+        let address = Address::from_witness_program(program, network)?;
+        Ok(Self {
+            index: derived.index,
+            address,
+            keychain: derived.keychain,
+        })
+    }
+}
+
+impl Deref for AddressInfo {
+    type Target = Address;
+
+    fn deref(&self) -> &Self::Target {
+        &self.address
+    }
+}
+
+impl fmt::Display for AddressInfo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.address.fmt(formatter)
+    }
+}
+
 /// Errors produced when creating, opening or saving a wallet.
 #[derive(Debug, thiserror::Error)]
 pub enum WalletError {
-    /// The address network is unsupported.
+    /// The network or witness program cannot form a share chain address.
     #[error(transparent)]
     Address(#[from] AddressError),
     /// A descriptor could not be parsed or accepted by the wallet.
@@ -60,6 +103,9 @@ pub enum WalletError {
 /// The database stores public descriptors and wallet state, not signing keys.
 /// Imported private descriptor keys remain in the newly created wallet's
 /// memory.
+///
+/// Methods that reveal an address save it with [`Wallet::persist`] before
+/// returning it. A descriptor without a wildcard has one address, at index 0.
 pub struct Wallet {
     inner: PersistedWallet<Connection>,
     connection: Connection,
@@ -154,6 +200,107 @@ impl Wallet {
         self.inner.public_descriptor(keychain)
     }
 
+    /// Derive the address at `index` without revealing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is above 2^31 - 1 on a wildcard descriptor.
+    pub fn peek_address(
+        &self,
+        keychain: KeychainKind,
+        index: u32,
+    ) -> Result<AddressInfo, WalletError> {
+        AddressInfo::from_bdk(
+            self.inner.peek_address(keychain, index),
+            self.inner.network(),
+        )
+    }
+
+    /// Reveal the next address.
+    pub fn reveal_next_address(
+        &mut self,
+        keychain: KeychainKind,
+    ) -> Result<AddressInfo, WalletError> {
+        let derived = self.inner.reveal_next_address(keychain);
+        self.persist_address(derived)
+    }
+
+    /// Reveal addresses up to `index`, returning only the newly revealed ones.
+    pub fn reveal_addresses_to(
+        &mut self,
+        keychain: KeychainKind,
+        index: u32,
+    ) -> Result<Vec<AddressInfo>, WalletError> {
+        let network = self.inner.network();
+        let addresses = self
+            .inner
+            .reveal_addresses_to(keychain, index)
+            .map(|derived| AddressInfo::from_bdk(derived, network))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.persist()?;
+        Ok(addresses)
+    }
+
+    /// Return the lowest revealed address no known transaction uses, revealing
+    /// the next one if all are used.
+    pub fn next_unused_address(
+        &mut self,
+        keychain: KeychainKind,
+    ) -> Result<AddressInfo, WalletError> {
+        let derived = self.inner.next_unused_address(keychain);
+        self.persist_address(derived)
+    }
+
+    /// Iterate over revealed addresses that are neither used nor reserved.
+    pub fn list_unused_addresses(
+        &self,
+        keychain: KeychainKind,
+    ) -> impl DoubleEndedIterator<Item = Result<AddressInfo, WalletError>> + '_ {
+        self.inner
+            .list_unused_addresses(keychain)
+            .map(|derived| AddressInfo::from_bdk(derived, self.inner.network()))
+    }
+
+    /// Return whether `script` belongs to the wallet, including lookahead scripts.
+    pub fn is_mine(&self, script: ScriptBuf) -> bool {
+        self.inner.is_mine(script)
+    }
+
+    /// Return the keychain and index that derive `script`.
+    pub fn derivation_of_spk(&self, script: ScriptBuf) -> Option<(KeychainKind, u32)> {
+        self.inner.derivation_of_spk(script)
+    }
+
+    /// Return the highest revealed index, if any.
+    pub fn derivation_index(&self, keychain: KeychainKind) -> Option<u32> {
+        self.inner.derivation_index(keychain)
+    }
+
+    /// Return the index the next reveal would use.
+    pub fn next_derivation_index(&self, keychain: KeychainKind) -> u32 {
+        self.inner.next_derivation_index(keychain)
+    }
+
+    /// Reserve an address so it is not handed out again, until `unmark_used`.
+    ///
+    /// Reservations are kept in memory only. Returns false if the address is
+    /// not revealed or is already used.
+    pub fn mark_used(&mut self, keychain: KeychainKind, index: u32) -> bool {
+        self.inner.mark_used(keychain, index)
+    }
+
+    /// Release a reservation, returning false if a transaction uses the address.
+    pub fn unmark_used(&mut self, keychain: KeychainKind, index: u32) -> bool {
+        self.inner.unmark_used(keychain, index)
+    }
+
+    /// Encode a derived address and save wallet state before returning it.
+    fn persist_address(&mut self, derived: BdkAddressInfo) -> Result<AddressInfo, WalletError> {
+        let address = AddressInfo::from_bdk(derived, self.inner.network())?;
+        self.persist()?;
+        Ok(address)
+    }
+
     /// Save staged changes, returning whether anything was written.
     ///
     /// A failed write keeps the changes staged, so a later call retries them.
@@ -180,11 +327,13 @@ mod tests {
     use super::*;
     use bdk_wallet::LoadMismatch;
     use bitcoin::hashes::Hash;
+    use bitcoin::{Amount, OutPoint, Transaction, TxIn, TxOut, Txid, absolute, transaction};
     use tempfile::tempdir;
 
     const RECEIVE: &str = "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)";
     const CHANGE: &str = "tr(c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)";
     const SEGWIT: &str = "wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)";
+    const TEST_PUBLIC_KEY: &str = "tpubD6NzVbkrYhZ4Y55A58Gv9RSNF5hy84b5AJqYy7sCcjFrkcLpPre8kmgfit6kY1Zs3BLgeypTDBZJM222guPpdz7Cup5yzaMu62u7mYGbwFL";
 
     #[test]
     fn wallet_reopen_preserves_descriptors_and_rejects_identity_conflicts() {
@@ -281,5 +430,191 @@ mod tests {
             Wallet::open(&path, chain),
             Err(WalletError::UnsupportedDescriptor(KeychainKind::External))
         ));
+    }
+
+    #[test]
+    fn address_derivation_preserves_taproot_scripts_and_saved_indices() {
+        let chain = ChainIdentity {
+            network: Network::Signet,
+            sharechain_genesis_hash: BlockHash::from_byte_array([42; 32]),
+        };
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("wallet.sqlite");
+        let descriptor = format!(
+            "tr({TEST_PUBLIC_KEY}/<0;1>/*,pk(c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5))"
+        );
+        let mut wallet = Wallet::create(&path, &descriptor, None, chain).unwrap();
+        let peeked = wallet.peek_address(KeychainKind::External, 2).unwrap();
+        assert_eq!(
+            peeked.script_pubkey(),
+            wallet
+                .inner
+                .peek_address(KeychainKind::External, 2)
+                .script_pubkey()
+        );
+        assert!(peeked.to_string().starts_with("sp2pool1p"));
+        assert!(wallet.is_mine(peeked.script_pubkey()));
+        assert_eq!(
+            wallet.derivation_of_spk(peeked.script_pubkey()),
+            Some((KeychainKind::External, 2))
+        );
+        assert!(!wallet.is_mine(ScriptBuf::new()));
+        assert_eq!(wallet.derivation_index(KeychainKind::External), None);
+        assert!(!wallet.persist().unwrap());
+
+        let first = wallet.reveal_next_address(KeychainKind::External).unwrap();
+        assert_eq!(first.index, 0);
+        let remaining = wallet
+            .reveal_addresses_to(KeychainKind::External, 2)
+            .unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].index, 1);
+        assert_eq!(remaining[1], peeked);
+        let change = wallet.reveal_next_address(KeychainKind::Internal).unwrap();
+        assert_eq!(change.keychain, KeychainKind::Internal);
+        assert_eq!(change.index, 0);
+        assert_ne!(change.address, first.address);
+        drop(wallet);
+
+        let mut reopened = Wallet::open(&path, chain).unwrap();
+        assert_eq!(
+            reopened.peek_address(KeychainKind::External, 2).unwrap(),
+            peeked
+        );
+        assert_eq!(reopened.derivation_index(KeychainKind::External), Some(2));
+        assert_eq!(reopened.next_derivation_index(KeychainKind::External), 3);
+        assert_eq!(reopened.next_derivation_index(KeychainKind::Internal), 1);
+        assert!(
+            reopened
+                .reveal_addresses_to(KeychainKind::External, 2)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .next_unused_address(KeychainKind::External)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            reopened
+                .list_unused_addresses(KeychainKind::Internal)
+                .next()
+                .unwrap()
+                .unwrap(),
+            change
+        );
+    }
+
+    #[test]
+    fn address_usage_persists_transactions_but_not_reservations() {
+        let chain = ChainIdentity {
+            network: Network::Regtest,
+            sharechain_genesis_hash: BlockHash::from_byte_array([42; 32]),
+        };
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("wallet.sqlite");
+        let descriptor = format!("tr({TEST_PUBLIC_KEY}/0/*)");
+        let mut wallet = Wallet::create(&path, &descriptor, None, chain).unwrap();
+        let addresses = wallet
+            .reveal_addresses_to(KeychainKind::External, 2)
+            .unwrap();
+        assert!(wallet.mark_used(KeychainKind::External, 1));
+        assert_eq!(
+            wallet
+                .list_unused_addresses(KeychainKind::External)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![addresses[0].clone(), addresses[2].clone()]
+        );
+        assert!(wallet.unmark_used(KeychainKind::External, 1));
+        assert!(wallet.mark_used(KeychainKind::External, 1));
+        let payment = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([43; 32]),
+                    vout: 0,
+                },
+                ..TxIn::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000_000),
+                script_pubkey: addresses[0].script_pubkey(),
+            }],
+        };
+        wallet.inner.apply_unconfirmed_txs([(payment, 1)]);
+        assert!(!wallet.unmark_used(KeychainKind::External, 0));
+        assert_eq!(
+            wallet.next_unused_address(KeychainKind::External).unwrap(),
+            addresses[2]
+        );
+        drop(wallet);
+
+        let mut reopened = Wallet::open(&path, chain).unwrap();
+        assert!(!reopened.unmark_used(KeychainKind::External, 0));
+        assert_eq!(
+            reopened
+                .next_unused_address(KeychainKind::External)
+                .unwrap(),
+            addresses[1]
+        );
+        assert_eq!(
+            reopened
+                .list_unused_addresses(KeychainKind::External)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            addresses[1..]
+        );
+    }
+
+    #[test]
+    fn failed_address_write_retains_changes_for_retry() {
+        let chain = ChainIdentity {
+            network: Network::Signet,
+            sharechain_genesis_hash: BlockHash::from_byte_array([42; 32]),
+        };
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("wallet.sqlite");
+        let descriptor = format!("tr({TEST_PUBLIC_KEY}/0/*)");
+        let mut wallet = Wallet::create(&path, &descriptor, None, chain).unwrap();
+        wallet
+            .connection
+            .pragma_update(None, "query_only", true)
+            .unwrap();
+        assert!(matches!(
+            wallet.reveal_addresses_to(KeychainKind::External, 2),
+            Err(WalletError::Storage(_))
+        ));
+        assert!(matches!(
+            wallet.next_unused_address(KeychainKind::External),
+            Err(WalletError::Storage(_))
+        ));
+        assert_eq!(
+            wallet
+                .peek_address(KeychainKind::External, 2)
+                .unwrap()
+                .index,
+            2
+        );
+        let saved = Wallet::open(&path, chain).unwrap();
+        assert_eq!(saved.derivation_index(KeychainKind::External), None);
+        drop(saved);
+
+        wallet
+            .connection
+            .pragma_update(None, "query_only", false)
+            .unwrap();
+        assert!(
+            wallet
+                .reveal_addresses_to(KeychainKind::External, 2)
+                .unwrap()
+                .is_empty()
+        );
+        drop(wallet);
+        let reopened = Wallet::open(&path, chain).unwrap();
+        assert_eq!(reopened.derivation_index(KeychainKind::External), Some(2));
+        assert_eq!(reopened.next_derivation_index(KeychainKind::External), 3);
     }
 }
