@@ -78,6 +78,8 @@
 #[cfg(feature = "wallet")]
 pub mod electrum;
 #[cfg(feature = "wallet")]
+pub mod import;
+#[cfg(feature = "wallet")]
 pub mod wallet;
 pub mod witness_program_codec;
 
