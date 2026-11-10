@@ -6,17 +6,22 @@
 
 use crate::{AddressError, expected_hrp};
 use bdk_wallet::descriptor::{DescriptorError, ExtendedDescriptor, IntoWalletDescriptor};
+use bdk_wallet::keys::KeyError;
 use bdk_wallet::miniscript::descriptor::KeyMap;
-use bdk_wallet::rusqlite::{Connection, Error as SqliteError, ErrorCode, OpenFlags};
+use bdk_wallet::rusqlite::{
+    Connection, Error as SqliteError, ErrorCode, OpenFlags, OptionalExtension,
+};
 use bdk_wallet::{
     CreateParams, CreateWithPersistError, KeychainKind, LoadError, LoadWithPersistError,
     PersistedWallet, Wallet as BdkWallet,
 };
 use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::{BlockHash, Network};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind};
+use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -29,6 +34,23 @@ const WALLET_APPLICATION_ID: i32 = 0x5032_5057;
 /// Permissions of a new wallet database file: owner read and write only.
 #[cfg(unix)]
 const DATABASE_FILE_MODE: u32 = 0o600;
+
+/// Table holding a wallet's Electrum config in at most one row, id 0. Every
+/// wallet gets the table when it is created; the row is written only for a
+/// wallet created with an Electrum config.
+const CREATE_ELECTRUM_CONFIG_TABLE: &str = "CREATE TABLE p2poolv2_wallet_electrum (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    config TEXT NOT NULL
+)";
+
+/// Electrum server config saved with a wallet, used to sync it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ElectrumConfig {
+    /// Electrum server URL, `tcp://HOST:PORT`.
+    pub url: String,
+    /// Maximum number of queries per Electrum batch.
+    pub batch_size: NonZeroUsize,
+}
 
 /// The network and share chain a wallet belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +107,11 @@ pub enum WalletError {
     Address(#[from] AddressError),
     /// A descriptor could not be parsed or accepted by the wallet.
     #[error(transparent)]
-    Descriptor(#[from] DescriptorError),
+    Descriptor(DescriptorError),
+    /// A descriptor is not valid descriptor syntax. The descriptor text is
+    /// left out of the error, because it can hold a private key.
+    #[error("The {0} descriptor is not a valid descriptor")]
+    InvalidDescriptor(Keychain),
     /// A descriptor does not produce taproot outputs.
     #[error("The {0} descriptor must use taproot")]
     UnsupportedDescriptor(Keychain),
@@ -110,6 +136,9 @@ pub enum WalletError {
     /// The database path could not be accessed.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// The Electrum config could not be encoded, or the saved one decoded.
+    #[error("The wallet Electrum config is invalid: {0}")]
+    ElectrumConfig(#[from] serde_json::Error),
     /// Writing a new wallet failed and its database file could not be removed.
     #[error("{error}; the new database file could not be removed: {removal}")]
     PartialDatabase {
@@ -130,6 +159,9 @@ pub enum WalletError {
 /// * Accept only networks that have a share chain address prefix.
 /// * Accept only taproot descriptors, both when creating a wallet and when
 ///   opening a database another tool may have written.
+/// * Check descriptors before any file is created, through
+///   `WalletDescriptors`, and leave descriptor text out of parse errors,
+///   because it can hold a private key.
 /// * Pin the wallet to a network and share chain genesis hash, and refuse to
 ///   open it for any other chain.
 /// * Own the database file: never overwrite an existing file, create it
@@ -141,13 +173,78 @@ pub enum WalletError {
 ///   processes cannot hand out the same address.
 /// * Keep the bdk wallet paired with the connection it was created or loaded
 ///   from, so staged changes are always saved to the same database.
+/// * Own every read and write of the database, including the Electrum
+///   config, which is written with the new wallet before the file is marked
+///   complete.
 ///
-/// The database stores public descriptors and wallet state, not signing keys.
+/// The database stores public descriptors, wallet state and the Electrum
+/// config, not signing keys.
 /// Imported private descriptor keys remain in the newly created wallet's
 /// memory.
 pub struct Wallet {
     inner: PersistedWallet<Connection>,
     connection: Connection,
+}
+
+/// Receive and change descriptors checked for a wallet on one network.
+///
+/// Parsing checks that the network has a share chain address prefix and that
+/// each descriptor is taproot, so a caller can reject bad input, or input with
+/// private keys, before doing any other work. A descriptor that is not valid
+/// descriptor syntax is reported without its text.
+pub struct WalletDescriptors {
+    network: Network,
+    receive: (ExtendedDescriptor, KeyMap),
+    change: Option<(ExtendedDescriptor, KeyMap)>,
+}
+
+impl WalletDescriptors {
+    /// Parse `descriptor`, and `change_descriptor` if given, for `network`.
+    ///
+    /// A two-path descriptor supplies both keychains when `change_descriptor`
+    /// is `None`.
+    pub fn parse(
+        descriptor: &str,
+        change_descriptor: Option<&str>,
+        network: Network,
+    ) -> Result<Self, WalletError> {
+        //* Reject a network with no share chain prefix, then parse each descriptor as taproot with one shared context.
+        expected_hrp(network)?;
+        let secp256k1_context = Secp256k1::new();
+        let receive = parse_descriptor(&secp256k1_context, descriptor, network, Keychain::Receive)?;
+        let change = change_descriptor
+            .map(|change_descriptor| {
+                parse_descriptor(
+                    &secp256k1_context,
+                    change_descriptor,
+                    network,
+                    Keychain::Change,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            network,
+            receive,
+            change,
+        })
+    }
+
+    /// The first keychain, receive before change, whose descriptor carries
+    /// private keys, or `None` if every descriptor is public.
+    ///
+    /// A two-path receive descriptor holds the keys of both keychains, so its
+    /// private keys are reported for `Receive`.
+    pub fn keychain_with_private_keys(&self) -> Option<Keychain> {
+        let change_has_private_keys = self
+            .change
+            .as_ref()
+            .is_some_and(|(_, keys)| !keys.is_empty());
+        match (!self.receive.1.is_empty(), change_has_private_keys) {
+            (true, _) => Some(Keychain::Receive),
+            (false, true) => Some(Keychain::Change),
+            (false, false) => None,
+        }
+    }
 }
 
 impl Wallet {
@@ -163,37 +260,46 @@ impl Wallet {
         change_descriptor: Option<&str>,
         chain: ChainIdentity,
     ) -> Result<Self, WalletError> {
-        //* Reject a network with no share chain prefix and a non-taproot receive descriptor.
-        expected_hrp(chain.network)?;
-        let secp256k1_context = Secp256k1::new();
-        let external = parse_descriptor(
-            &secp256k1_context,
-            descriptor,
-            chain.network,
-            Keychain::Receive,
-        )?;
+        let descriptors = WalletDescriptors::parse(descriptor, change_descriptor, chain.network)?;
+        Self::create_from_descriptors(
+            database_path,
+            descriptors,
+            chain.sharechain_genesis_hash,
+            None,
+        )
+    }
+
+    /// Create a wallet from checked `descriptors` in a new database file at
+    /// `database_path`, pinned to the descriptors' network and
+    /// `sharechain_genesis_hash`, failing if any file already exists there.
+    ///
+    /// `electrum_config`, if given, is saved in the same database before the
+    /// file is marked as a complete wallet, so an opened wallet never lacks
+    /// the config it was created with. The parent directory must exist. If
+    /// the wallet cannot be written, the new database file is removed.
+    pub fn create_from_descriptors(
+        database_path: &Path,
+        descriptors: WalletDescriptors,
+        sharechain_genesis_hash: BlockHash,
+        electrum_config: Option<&ElectrumConfig>,
+    ) -> Result<Self, WalletError> {
         //* Pick the keychain layout and pin the network and share chain genesis.
-        let create_parameters = match change_descriptor {
-            Some(change_descriptor) => {
-                let internal = parse_descriptor(
-                    &secp256k1_context,
-                    change_descriptor,
-                    chain.network,
-                    Keychain::Change,
-                )?;
-                BdkWallet::create(external, internal)
-            }
-            None if external.0.is_multipath() => {
-                BdkWallet::create_from_two_path_descriptor(external)
-            }
-            None => BdkWallet::create_single(external),
+        let WalletDescriptors {
+            network,
+            receive,
+            change,
+        } = descriptors;
+        let create_parameters = match change {
+            Some(change) => BdkWallet::create(receive, change),
+            None if receive.0.is_multipath() => BdkWallet::create_from_two_path_descriptor(receive),
+            None => BdkWallet::create_single(receive),
         }
-        .network(chain.network)
-        .genesis_hash(chain.sharechain_genesis_hash);
+        .network(network)
+        .genesis_hash(sharechain_genesis_hash);
 
         //* Write the wallet into a new database file, removing the file on failure.
         create_database_file(database_path)?;
-        match write_new_wallet(database_path, create_parameters) {
+        match write_new_wallet(database_path, create_parameters, electrum_config) {
             Ok((inner, connection)) => Ok(Self { inner, connection }),
             Err(error) => Err(remove_partial_database(database_path, error)),
         }
@@ -258,6 +364,22 @@ impl Wallet {
     /// A failed write keeps the changes staged, so a later call retries them.
     pub fn persist(&mut self) -> Result<bool, WalletError> {
         Ok(self.inner.persist(&mut self.connection)?)
+    }
+
+    /// The Electrum config saved when the wallet was created, or `None` for a
+    /// wallet created without one.
+    pub fn electrum_config(&self) -> Result<Option<ElectrumConfig>, WalletError> {
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT config FROM p2poolv2_wallet_electrum WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(encoded
+            .map(|encoded| serde_json::from_str(&encoded))
+            .transpose()?)
     }
 }
 
@@ -331,10 +453,12 @@ fn classify_open_error(error: SqliteError) -> WalletError {
 ///
 /// bdk commits its tables and the wallet in separate transactions, so the
 /// application id is written last: a file without it never holds a complete
-/// wallet, whether the write failed or the process stopped part way.
+/// wallet, whether the write failed or the process stopped part way. The
+/// Electrum config table, and the config if given, are written before it.
 fn write_new_wallet(
     database_path: &Path,
     create_parameters: CreateParams,
+    electrum_config: Option<&ElectrumConfig>,
 ) -> Result<(PersistedWallet<Connection>, Connection), WalletError> {
     let mut connection = open_database_file(database_path)?;
     lock_database(&connection)?;
@@ -345,8 +469,28 @@ fn write_new_wallet(
             CreateWithPersistError::Descriptor(error) => WalletError::Descriptor(error),
             CreateWithPersistError::Persist(error) => WalletError::Storage(error),
         })?;
+    write_electrum_config(&connection, electrum_config)?;
     connection.pragma_update(None, "application_id", WALLET_APPLICATION_ID)?;
     Ok((inner, connection))
+}
+
+/// Create the Electrum config table in a new wallet database and save
+/// `electrum_config` in it, if given.
+fn write_electrum_config(
+    connection: &Connection,
+    electrum_config: Option<&ElectrumConfig>,
+) -> Result<(), WalletError> {
+    connection.execute_batch(CREATE_ELECTRUM_CONFIG_TABLE)?;
+    match electrum_config {
+        Some(electrum_config) => {
+            connection.execute(
+                "INSERT INTO p2poolv2_wallet_electrum (id, config) VALUES (0, ?1)",
+                [serde_json::to_string(electrum_config)?],
+            )?;
+            Ok(())
+        }
+        None => Ok(()),
+    }
 }
 
 /// Remove the database file left by a failed create, returning `error`, or
@@ -364,17 +508,37 @@ fn remove_partial_database(database_path: &Path, error: WalletError) -> WalletEr
 /// Parse a descriptor for `network` with the caller's `secp256k1_context`,
 /// rejecting one that is not taproot.
 ///
-/// bdk requires a full signing and verification context here, so `create`
-/// builds one and shares it across both of its descriptors.
+/// bdk requires a full signing and verification context here, so
+/// `WalletDescriptors::parse` builds one and shares it across both
+/// descriptors. A syntax error is reported as `InvalidDescriptor`, without the
+/// descriptor text.
 fn parse_descriptor(
     secp256k1_context: &Secp256k1<All>,
     descriptor: &str,
     network: Network,
     keychain: Keychain,
 ) -> Result<(ExtendedDescriptor, KeyMap), WalletError> {
-    let parsed = descriptor.into_wallet_descriptor(secp256k1_context, network.into())?;
+    let parsed = descriptor
+        .into_wallet_descriptor(secp256k1_context, network.into())
+        .map_err(|error| hide_descriptor_text(error, keychain))?;
     require_taproot(&parsed.0, keychain)?;
     Ok(parsed)
+}
+
+/// Replace a descriptor error that can quote the input with
+/// `InvalidDescriptor` for `keychain`.
+///
+/// Miniscript quotes the part of the input it could not parse, and bdk's key
+/// `Message` carries a key parser's error text, so a user who pastes a private
+/// key where a descriptor belongs could see the key echoed back. The other
+/// descriptor errors carry no input text.
+fn hide_descriptor_text(error: DescriptorError, keychain: Keychain) -> WalletError {
+    match error {
+        DescriptorError::Miniscript(_) | DescriptorError::Key(KeyError::Message(_)) => {
+            WalletError::InvalidDescriptor(keychain)
+        }
+        error => WalletError::Descriptor(error),
+    }
 }
 
 /// Fail with `UnsupportedDescriptor` for `keychain` unless `descriptor`
@@ -390,7 +554,9 @@ fn require_taproot(descriptor: &ExtendedDescriptor, keychain: Keychain) -> Resul
 mod tests {
     use super::*;
     use bdk_wallet::LoadMismatch;
+    use bitcoin::PrivateKey;
     use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::SecretKey;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
@@ -746,5 +912,76 @@ mod tests {
         ));
         //* Create removed the file it made.
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn wallet_create_hides_a_private_key_pasted_as_a_descriptor() {
+        let chain = ChainIdentity {
+            network: Network::Signet,
+            sharechain_genesis_hash: BlockHash::from_byte_array([42; 32]),
+        };
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("wallet.sqlite");
+        //* A fixed test key in WIF form, pasted where the receive descriptor belongs.
+        let secret_key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let wif = PrivateKey::new(secret_key, Network::Signet).to_wif();
+
+        //* Create reports the receive descriptor as invalid, before any file is created.
+        let error = match Wallet::create(&path, &wif, None, chain) {
+            Err(error) => error,
+            Ok(_) => panic!("a bare private key is not a descriptor"),
+        };
+        assert!(matches!(
+            error,
+            WalletError::InvalidDescriptor(Keychain::Receive)
+        ));
+        assert!(!path.exists());
+        //* Neither the message nor the debug form of the error contains the key.
+        assert!(!format!("{error}").contains(&wif));
+        assert!(!format!("{error:?}").contains(&wif));
+    }
+
+    #[test]
+    fn wallet_descriptors_report_private_keys_for_the_keychain_that_holds_them() {
+        let secret_key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let private_change = format!(
+            "tr({})",
+            PrivateKey::new(secret_key, Network::Signet).to_wif()
+        );
+        //* Public receive and change descriptors carry no private keys.
+        let public = WalletDescriptors::parse(RECEIVE, Some(CHANGE), Network::Signet).unwrap();
+        assert_eq!(public.keychain_with_private_keys(), None);
+        //* A private change descriptor behind a public receive descriptor is reported for change.
+        let private =
+            WalletDescriptors::parse(RECEIVE, Some(&private_change), Network::Signet).unwrap();
+        assert_eq!(private.keychain_with_private_keys(), Some(Keychain::Change));
+    }
+
+    #[test]
+    fn wallet_created_with_an_electrum_config_returns_it_after_reopening() {
+        let chain = ChainIdentity {
+            network: Network::Signet,
+            sharechain_genesis_hash: BlockHash::from_byte_array([42; 32]),
+        };
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("wallet.sqlite");
+        let electrum_config = ElectrumConfig {
+            url: "tcp://127.0.0.1:50001".to_owned(),
+            batch_size: NonZeroUsize::new(10).unwrap(),
+        };
+        //* Create the wallet with the Electrum config, then close it.
+        let descriptors = WalletDescriptors::parse(RECEIVE, Some(CHANGE), Network::Signet).unwrap();
+        let wallet = Wallet::create_from_descriptors(
+            &path,
+            descriptors,
+            chain.sharechain_genesis_hash,
+            Some(&electrum_config),
+        )
+        .unwrap();
+        drop(wallet);
+
+        //* Reopening returns the same config.
+        let reopened = Wallet::open(&path, chain).unwrap();
+        assert_eq!(reopened.electrum_config().unwrap(), Some(electrum_config));
     }
 }

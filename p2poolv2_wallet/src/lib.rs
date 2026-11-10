@@ -72,11 +72,13 @@
 #[cfg(feature = "wallet")]
 pub mod electrum;
 #[cfg(feature = "wallet")]
+pub mod import;
+#[cfg(feature = "wallet")]
 pub mod wallet;
 pub mod witness_program_codec;
 
 #[cfg(feature = "wallet")]
-pub use wallet::{ChainIdentity, Keychain, Wallet, WalletError};
+pub use wallet::{ChainIdentity, ElectrumConfig, Keychain, Wallet, WalletDescriptors, WalletError};
 
 use bitcoin::bech32::primitives::decode::{PaddingError, SegwitHrpstringError};
 use bitcoin::bech32::{Hrp, segwit};
