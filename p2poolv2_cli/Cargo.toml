@@ -19,7 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 p2poolv2_lib = { workspace = true }
-p2poolv2_wallet = { workspace = true }
+p2poolv2_wallet = { workspace = true, features = ["wallet"] }
 bitcoin = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -35,9 +35,10 @@ sha2 = { workspace = true }
 rpassword = "7.3"
 reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
-tempfile = { workspace = true }
 
